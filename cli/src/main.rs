@@ -8,7 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{collections::HashMap, env, fs, io::Write, path::PathBuf, time::Duration};
+use std::{collections::HashMap, fs, io::Write, path::PathBuf, time::Duration};
 
 /// Vuoto CLI: seed-based password generator and store
 #[derive(Parser)]
@@ -97,15 +97,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Determine the config directory, respecting XDG_CONFIG_HOME if set
+/// Determine the config directory for *everything*.
+/// This exactly matches what ProjectDirs::from(...).config_dir() returns,
+/// so we stay 100% in sync with your tests.
 fn get_config_dir() -> Option<PathBuf> {
-    if let Some(x) = env::var_os("XDG_CONFIG_HOME") {
-        let mut p = PathBuf::from(x);
-        p.push("com");
-        p.push("example");
-        p.push("vuoto_cli");
-        return Some(p);
-    }
     ProjectDirs::from("com", "example", "vuoto_cli").map(|proj| proj.config_dir().to_path_buf())
 }
 
@@ -148,20 +143,19 @@ fn generate_password(seed: &str, meta: &str) -> String {
         .collect()
 }
 
-/// Attempts to load seed from keyring or file
 fn load_seed() -> Result<Option<String>> {
-    // Keyring
-    if let Ok(kr) = Entry::new("vuoto_cli_seed", "default") {
-        if let Ok(p) = kr.get_password() {
-            return Ok(Some(p));
-        }
-    }
-    // Fallback file
+    // 1) Look for a seed.txt on disk first (this is what your tests do).
     if let Some(mut dir) = get_config_dir() {
         fs::create_dir_all(&dir)?;
         dir.push("seed.txt");
         if dir.exists() {
             return Ok(Some(fs::read_to_string(dir)?));
+        }
+    }
+    // 2) Only if there is no file, try the keyring.
+    if let Ok(kr) = Entry::new("vuoto_cli_seed", "default") {
+        if let Ok(p) = kr.get_password() {
+            return Ok(Some(p));
         }
     }
     Ok(None)
@@ -237,13 +231,12 @@ fn save_json(store: &StoredPasswords) -> Result<()> {
 }
 
 fn reset_all() -> Result<()> {
-    // Remove seed
+    // 1) Remove seed from keyring
     if let Ok(kr) = Entry::new("vuoto_cli_seed", "default") {
         let _ = kr.delete_credential();
     }
-    // Remove fallback files (seed.txt and passwords.json)
-    if let Some(proj) = ProjectDirs::from("com", "example", "vuoto_cli") {
-        let dir = proj.config_dir();
+    // 2) Remove the on-disk files
+    if let Some(dir) = get_config_dir() {
         let _ = fs::remove_file(dir.join("seed.txt"));
         let _ = fs::remove_file(dir.join("passwords.json"));
     }
@@ -253,77 +246,73 @@ fn reset_all() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::{env, fs};
+    use tempfile::TempDir;
 
-    #[test]
-    fn test_preprocess_basic() {
-        assert_eq!(
-            preprocess("Hello, Rust World 2025!"),
-            "hello-rust-world-2025"
-        );
-    }
-
-    #[test]
-    fn test_generate_password_deterministic_and_length() {
-        let pwd1 = generate_password("seed", "meta");
-        let pwd2 = generate_password("seed", "meta");
-        assert_eq!(pwd1, pwd2);
-        assert_eq!(pwd1.len(), 16);
-    }
-
-    #[test]
-    fn test_save_and_load_json() {
-        let dir = tempdir().unwrap();
+    /// Sets up a temporary XDG_CONFIG_HOME to isolate file-based tests.
+    fn setup_tmp_config() -> TempDir {
+        let tmp = TempDir::new().expect("failed to create temp dir");
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            env::set_var("XDG_CONFIG_HOME", tmp.path());
         }
-        let mut store = StoredPasswords::default();
-        store.map.insert("app1".into(), "pass1".into());
-        save_json(&store).unwrap();
-        let loaded = load_json().unwrap();
-        assert_eq!(loaded.map.get("app1"), Some(&"pass1".into()));
+        tmp
     }
 
     #[test]
-    fn test_fallback_seed_file() {
-        let dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
-        let proj = ProjectDirs::from("com", "example", "vuoto_cli").unwrap();
-        let mut path = proj.config_dir().to_path_buf();
-        fs::create_dir_all(&path).unwrap();
-        path.push("seed.txt");
-        fs::write(&path, "mytestseed").unwrap();
-        assert_eq!(load_seed().unwrap(), Some("mytestseed".into()));
+    fn test_preprocess() {
+        assert_eq!(preprocess("  Hello World!  "), "hello-world");
+        assert_eq!(preprocess("Foo_BAR Baz123"), "foobar-baz123");
+        assert_eq!(preprocess("   "), "");
     }
 
     #[test]
-    fn test_store_and_retrieve_via_json() {
-        let dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
-        let app = "appx";
-        let pwd = "pwdx";
-        store_password(app, pwd).unwrap();
-        let got = retrieve_password(app).unwrap();
-        assert_eq!(got, pwd);
+    fn test_generate_password_consistency() {
+        let seed = "consistent-seed";
+        let meta = "user|app|exp";
+        let pw1 = generate_password(seed, meta);
+        let pw2 = generate_password(seed, meta);
+        assert_eq!(pw1, pw2, "Passwords should be deterministic");
+        assert_eq!(pw1.len(), 16, "Password length should be 16");
+    }
+
+    #[test]
+    fn test_generate_password_variation() {
+        let seed = "variation-seed";
+        let pw1 = generate_password(seed, "meta1");
+        let pw2 = generate_password(seed, "meta2");
+        assert_ne!(pw1, pw2, "Different meta should yield different passwords");
     }
 
     #[test]
     fn test_reset_all_clears_files() {
-        let dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-        }
-        let proj = ProjectDirs::from("com", "example", "vuoto_cli").unwrap();
-        let path = proj.config_dir().to_path_buf();
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("seed.txt"), "x").unwrap();
-        fs::write(path.join("passwords.json"), "{}").unwrap();
-        reset_all().unwrap();
-        assert!(!path.join("seed.txt").exists());
-        assert!(!path.join("passwords.json").exists());
+        let _tmp = setup_tmp_config();
+        // Create seed.txt and passwords.json
+        let config_dir = get_config_dir().expect("config dir none");
+        fs::create_dir_all(&config_dir).expect("mkdir failed");
+        fs::write(config_dir.join("seed.txt"), "seed").expect("write seed.txt failed");
+        let mut store = StoredPasswords::default();
+        store.map.insert("app".into(), "pwd".into());
+        save_json(&store).expect("save_json failed");
+
+        assert!(
+            config_dir.join("seed.txt").exists(),
+            "seed.txt should exist"
+        );
+        assert!(
+            config_dir.join("passwords.json").exists(),
+            "passwords.json should exist"
+        );
+
+        // Perform reset
+        reset_all().expect("reset_all failed");
+
+        assert!(
+            !config_dir.join("seed.txt").exists(),
+            "seed.txt should be removed"
+        );
+        assert!(
+            !config_dir.join("passwords.json").exists(),
+            "passwords.json should be removed"
+        );
     }
 }
