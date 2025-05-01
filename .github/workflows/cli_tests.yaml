@@ -1,4 +1,4 @@
-name: Tests
+name: Test CLI 
 
 on:
   push:
@@ -17,12 +17,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Build
-      run: cargo build --verbose
-
-    - name: Checkout CLI 
+    - name: Checkout directory
       run: cd cli 
 
-    - name: Test CLI 
+    - name: Build project
+      run: cargo build --verbose
+
+    - name: Run tests
       run: cargo test --verbose
 
