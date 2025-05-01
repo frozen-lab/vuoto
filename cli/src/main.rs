@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use console::style;
 use dialoguer::{Password, theme::ColorfulTheme};
@@ -8,7 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{collections::HashMap, fs, io::Write, path::PathBuf, time::Duration};
+use std::{collections::HashMap, env, fs, io::Write, path::PathBuf, time::Duration};
 
 /// Vuoto CLI: seed-based password generator and store
 #[derive(Parser)]
@@ -16,7 +16,7 @@ use std::{collections::HashMap, fs, io::Write, path::PathBuf, time::Duration};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    /// Skip the spinner animation
+    /// Skip spinner animation
     #[arg(long)]
     no_spinner: bool,
 }
@@ -40,7 +40,7 @@ enum Commands {
         #[arg(short, long)]
         app: String,
     },
-    /// Reset seed and all stored passwords
+    /// Reset seed and all stored data
     Reset,
 }
 
@@ -51,7 +51,6 @@ struct StoredPasswords {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     println!("{}", style("🔐 Vuoto CLI").bold().cyan());
 
     if let Commands::Reset = &cli.command {
@@ -60,8 +59,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let phrase = retrieve_or_prompt()?;
-    let seed = preprocess(&phrase);
+    // Load or prompt seed
+    let seed = match load_seed()? {
+        Some(s) => s,
+        None => prompt_and_store_seed()?,
+    };
+    let processed_seed = preprocess(&seed);
 
     match cli.command {
         Commands::Generate { username, app, exp } => {
@@ -72,7 +75,7 @@ fn main() -> Result<()> {
                 app,
                 exp.unwrap_or_default()
             );
-            let pwd = generate_password(&seed, &meta);
+            let pwd = generate_password(&processed_seed, &meta);
             store_password(&app, &pwd)?;
             println!(
                 "Password for {}: {}",
@@ -91,8 +94,19 @@ fn main() -> Result<()> {
         }
         Commands::Reset => unreachable!(),
     }
-
     Ok(())
+}
+
+/// Determine the config directory, respecting XDG_CONFIG_HOME if set
+fn get_config_dir() -> Option<PathBuf> {
+    if let Some(x) = env::var_os("XDG_CONFIG_HOME") {
+        let mut p = PathBuf::from(x);
+        p.push("com");
+        p.push("example");
+        p.push("vuoto_cli");
+        return Some(p);
+    }
+    ProjectDirs::from("com", "example", "vuoto_cli").map(|proj| proj.config_dir().to_path_buf())
 }
 
 fn preprocess(input: &str) -> String {
@@ -112,7 +126,6 @@ fn animate(msg: &str, spinner_on: bool) {
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
         );
         sp.enable_steady_tick(Duration::from_millis(80));
-        // use owned String to satisfy 'static requirement
         sp.set_message(msg.to_string());
         std::thread::sleep(Duration::from_millis(500));
         sp.finish_and_clear();
@@ -135,105 +148,182 @@ fn generate_password(seed: &str, meta: &str) -> String {
         .collect()
 }
 
-fn retrieve_or_prompt() -> Result<String> {
-    let kr = Entry::new("vuoto_cli_seed", "default").context("Keyring init failed")?;
-    match kr.get_password() {
-        Ok(p) => Ok(p),
-        Err(e) if e.to_string().contains("No such object") => prompt_and_store(&kr),
-        Err(e) if e.to_string().contains("Failed to connect to socket") => fallback_prompt(),
-        Err(e) => {
-            eprintln!("{} {}", style("Warn:").yellow(), e);
-            fallback_prompt()
+/// Attempts to load seed from keyring or file
+fn load_seed() -> Result<Option<String>> {
+    // Keyring
+    if let Ok(kr) = Entry::new("vuoto_cli_seed", "default") {
+        if let Ok(p) = kr.get_password() {
+            return Ok(Some(p));
         }
     }
+    // Fallback file
+    if let Some(mut dir) = get_config_dir() {
+        fs::create_dir_all(&dir)?;
+        dir.push("seed.txt");
+        if dir.exists() {
+            return Ok(Some(fs::read_to_string(dir)?));
+        }
+    }
+    Ok(None)
 }
 
-fn prompt_and_store(kr: &Entry) -> Result<String> {
-    let p = Password::with_theme(&ColorfulTheme::default())
+/// Prompt user for seed and store in both keyring and file
+fn prompt_and_store_seed() -> Result<String> {
+    let phrase = Password::with_theme(&ColorfulTheme::default())
         .with_prompt("Enter a secret seed phrase (20+ chars)")
         .with_confirmation("Confirm", "Mismatch")
         .interact()?;
-    if p.len() < 20 {
-        anyhow::bail!("Seed phrase must be 20+ characters");
+    if phrase.len() < 20 {
+        bail!("Seed phrase must be 20+ characters");
     }
-    kr.set_password(&p)?;
+    // Store in keyring (ignore errors)
+    if let Ok(kr) = Entry::new("vuoto_cli_seed", "default") {
+        let _ = kr.set_password(&phrase);
+    }
+    // Store to file
+    if let Some(mut dir) = get_config_dir() {
+        fs::create_dir_all(&dir)?;
+        dir.push("seed.txt");
+        fs::write(dir, &phrase)?;
+    }
     println!("{}", style("Seed saved securely 🎉").green());
-    Ok(p)
+    Ok(phrase)
 }
 
-fn fallback_prompt() -> Result<String> {
-    let proj = ProjectDirs::from("com", "example", "vuoto_cli").context("Config dir failed")?;
-    let mut path: PathBuf = proj.config_dir().to_path_buf();
-    fs::create_dir_all(&path)?;
-    path.push("seed.txt");
-    if path.exists() {
-        Ok(fs::read_to_string(&path)?)
-    } else {
-        let p = Password::with_theme(&ColorfulTheme::default())
-            .with_prompt("Enter a secret seed phrase (20+ chars)")
-            .with_confirmation("Confirm", "Mismatch")
-            .interact()?;
-        if p.len() < 20 {
-            anyhow::bail!("Seed must be 20+ chars");
-        }
-        fs::write(&path, &p)?;
-        println!("{} {}", style("Seed saved to").green(), path.display());
-        Ok(p)
-    }
-}
-
+/// Stores password in keyring; falls back to JSON file
 fn store_password(app: &str, pwd: &str) -> Result<()> {
-    let kr = Entry::new("vuoto_cli_pw", app)?;
-    match kr.set_password(pwd) {
-        Ok(_) => return Ok(()),
-        Err(e) if e.to_string().contains("Failed to connect") => (),
-        Err(e) => anyhow::bail!(e),
+    if let Ok(kr) = Entry::new("vuoto_cli_pw", app) {
+        if kr.set_password(pwd).is_ok() {
+            return Ok(());
+        }
     }
+    // JSON fallback
     let mut store = load_json()?;
     store.map.insert(app.to_string(), pwd.to_string());
     save_json(&store)
 }
 
+/// Retrieves password from keyring or JSON
 fn retrieve_password(app: &str) -> Result<String> {
-    let kr = Entry::new("vuoto_cli_pw", app)?;
-    if let Ok(p) = kr.get_password() {
-        return Ok(p);
+    if let Ok(kr) = Entry::new("vuoto_cli_pw", app) {
+        if let Ok(p) = kr.get_password() {
+            return Ok(p);
+        }
     }
     let store = load_json()?;
     store.map.get(app).cloned().context("Password not found")
 }
 
 fn load_json() -> Result<StoredPasswords> {
-    let proj = ProjectDirs::from("com", "example", "vuoto_cli").unwrap();
-    let mut path: PathBuf = proj.config_dir().to_path_buf();
-    fs::create_dir_all(&path)?;
-    path.push("passwords.json");
-    if path.exists() {
-        let data = fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&data)?)
-    } else {
-        Ok(StoredPasswords::default())
+    if let Some(mut dir) = get_config_dir() {
+        fs::create_dir_all(&dir)?;
+        dir.push("passwords.json");
+        if dir.exists() {
+            let data = fs::read_to_string(&dir)?;
+            return Ok(serde_json::from_str(&data)?);
+        }
     }
+    Ok(StoredPasswords::default())
 }
 
 fn save_json(store: &StoredPasswords) -> Result<()> {
-    let proj = ProjectDirs::from("com", "example", "vuoto_cli").unwrap();
-    let mut path: PathBuf = proj.config_dir().to_path_buf();
-    path.push("passwords.json");
-    let mut file = fs::File::create(&path)?;
-    file.write_all(serde_json::to_string_pretty(&store)?.as_bytes())?;
+    if let Some(mut dir) = get_config_dir() {
+        fs::create_dir_all(&dir)?;
+        dir.push("passwords.json");
+        let mut file = fs::File::create(&dir)?;
+        file.write_all(serde_json::to_string_pretty(&store)?.as_bytes())?;
+    }
     Ok(())
 }
 
 fn reset_all() -> Result<()> {
-    // delete seed from keyring and file
+    // Remove seed
     if let Ok(kr) = Entry::new("vuoto_cli_seed", "default") {
         let _ = kr.delete_credential();
     }
+    // Remove fallback files (seed.txt and passwords.json)
     if let Some(proj) = ProjectDirs::from("com", "example", "vuoto_cli") {
-        let dir: PathBuf = proj.config_dir().to_path_buf();
+        let dir = proj.config_dir();
         let _ = fs::remove_file(dir.join("seed.txt"));
         let _ = fs::remove_file(dir.join("passwords.json"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_preprocess_basic() {
+        assert_eq!(
+            preprocess("Hello, Rust World 2025!"),
+            "hello-rust-world-2025"
+        );
+    }
+
+    #[test]
+    fn test_generate_password_deterministic_and_length() {
+        let pwd1 = generate_password("seed", "meta");
+        let pwd2 = generate_password("seed", "meta");
+        assert_eq!(pwd1, pwd2);
+        assert_eq!(pwd1.len(), 16);
+    }
+
+    #[test]
+    fn test_save_and_load_json() {
+        let dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        let mut store = StoredPasswords::default();
+        store.map.insert("app1".into(), "pass1".into());
+        save_json(&store).unwrap();
+        let loaded = load_json().unwrap();
+        assert_eq!(loaded.map.get("app1"), Some(&"pass1".into()));
+    }
+
+    #[test]
+    fn test_fallback_seed_file() {
+        let dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        let proj = ProjectDirs::from("com", "example", "vuoto_cli").unwrap();
+        let mut path = proj.config_dir().to_path_buf();
+        fs::create_dir_all(&path).unwrap();
+        path.push("seed.txt");
+        fs::write(&path, "mytestseed").unwrap();
+        assert_eq!(load_seed().unwrap(), Some("mytestseed".into()));
+    }
+
+    #[test]
+    fn test_store_and_retrieve_via_json() {
+        let dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        let app = "appx";
+        let pwd = "pwdx";
+        store_password(app, pwd).unwrap();
+        let got = retrieve_password(app).unwrap();
+        assert_eq!(got, pwd);
+    }
+
+    #[test]
+    fn test_reset_all_clears_files() {
+        let dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        let proj = ProjectDirs::from("com", "example", "vuoto_cli").unwrap();
+        let path = proj.config_dir().to_path_buf();
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("seed.txt"), "x").unwrap();
+        fs::write(path.join("passwords.json"), "{}").unwrap();
+        reset_all().unwrap();
+        assert!(!path.join("seed.txt").exists());
+        assert!(!path.join("passwords.json").exists());
+    }
 }
