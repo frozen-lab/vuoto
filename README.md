@@ -1,1 +1,3 @@
 # Vuoto
+
+Benvenuto nel Vuoto!
