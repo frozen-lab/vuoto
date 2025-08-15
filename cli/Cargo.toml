@@ -1,9 +1,7 @@
 [package]
-name = "vuoto_cli"
+name = "vuoto"
 version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-clap = "4.5.40"
-turbocache = "0.0.2"
 
