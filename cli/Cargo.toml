@@ -7,3 +7,6 @@ edition = "2024"
 env_home = "0.1.0"
 turbocache = "0.0.5"
 
+[dev-dependencies]
+tempfile = "3.20.0"
+
