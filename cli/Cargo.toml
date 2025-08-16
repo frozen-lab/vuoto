@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 env_home = "0.1.0"
+inquire = "0.7.5"
 turbocache = "0.0.5"
 
 [dev-dependencies]
